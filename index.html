@@ -2,34 +2,197 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>3D Car Game - Ramps and Boost</title>
+  <title>3D City Drive</title>
   <script src="https://aframe.io/releases/1.5.0/aframe.min.js"></script>
 
   <script>
-    // ---------- 1. RAMP DATA ----------
-    // x, z = where the ramp sits | w = width | l = length | h = height at the top
-    // Ramps rise as you drive forward (towards -z). Change these numbers to move or resize them.
+    const THREE = AFRAME.THREE;
+
+    // =====================================================
+    // SECTION 1: SETTINGS (change these numbers to experiment)
+    // =====================================================
+    const ROAD = { half: 10, zMax: 60, zMin: -640 };      // the road runs from z=60 to z=-640
+    const LENGTH = ROAD.zMax - ROAD.zMin;                  // 700 m
+    const CROSS_STREETS = [-100, -260, -420, -560];        // z position of side streets
+    const TRAFFIC_PER_LANE = 12;                           // lower this if the game is slow
+    const PEDESTRIAN_COUNT = 36;                           // lower this if the game is slow
+
+    // Stunt ramps in the far-left lane (x = -7.5). x, z = position | w = width | l = length | h = height
     const RAMPS = [
-      { x: 0, z: -60,  w: 6, l: 14, h: 3.5 },
-      { x: 0, z: -170, w: 6, l: 20, h: 6 },
-      { x: 0, z: -300, w: 7, l: 26, h: 9 }
+      { x: -7.5, z: -180, w: 4.4, l: 14, h: 3 },
+      { x: -7.5, z: -340, w: 4.4, l: 22, h: 6 }
     ];
 
-    // Tells us how high the ground is at any (x, z) spot
+    const trafficList = [];   // every vehicle is stored here so the player car can crash into them
+
+    // How high is the ground at (x, z)? Flat = 0, on a ramp = higher.
     function getGroundHeight(x, z) {
       let height = 0;
       for (const r of RAMPS) {
         const insideWidth = Math.abs(x - r.x) <= r.w / 2;
         const insideLength = z <= r.z + r.l / 2 && z >= r.z - r.l / 2;
         if (insideWidth && insideLength) {
-          const t = (r.z + r.l / 2 - z) / r.l;   // 0 at the bottom, 1 at the top
+          const t = (r.z + r.l / 2 - z) / r.l;
           height = Math.max(height, t * r.h);
         }
       }
       return height;
     }
 
-    // ---------- 2. BUILD THE RAMPS ----------
+    // =====================================================
+    // SECTION 2: SMALL HELPER FUNCTIONS (for drawing 3D shapes)
+    // =====================================================
+    const geoCache = {}, matCache = {}, glowCache = {};
+
+    function geo(w, h, d) {
+      const key = w + '_' + h + '_' + d;
+      if (!geoCache[key]) geoCache[key] = new THREE.BoxGeometry(w, h, d);
+      return geoCache[key];
+    }
+    function mat(color) {
+      if (!matCache[color]) matCache[color] = new THREE.MeshStandardMaterial({ color: color, roughness: 0.6, metalness: 0.1 });
+      return matCache[color];
+    }
+    function glowMat(color) {
+      if (!glowCache[color]) glowCache[color] = new THREE.MeshBasicMaterial({ color: color });
+      return glowCache[color];
+    }
+    // Adds a box to a group. Last argument true = glowing (for lights)
+    function box(parent, w, h, d, x, y, z, color, glows) {
+      const m = new THREE.Mesh(geo(w, h, d), glows ? glowMat(color) : mat(color));
+      m.position.set(x, y, z);
+      parent.add(m);
+      return m;
+    }
+    function pick(list) { return list[Math.floor(Math.random() * list.length)]; }
+
+    // Make a texture by drawing on a canvas
+    function makeCanvas(w, h, drawFn) {
+      const c = document.createElement('canvas');
+      c.width = w; c.height = h;
+      drawFn(c.getContext('2d'), w, h);
+      return c;
+    }
+    function makeTex(canvas, repeatX, repeatY) {
+      const t = new THREE.CanvasTexture(canvas);
+      t.wrapS = t.wrapT = THREE.RepeatWrapping;
+      t.repeat.set(repeatX, repeatY);
+      t.anisotropy = 8;
+      if (THREE.SRGBColorSpace) t.colorSpace = THREE.SRGBColorSpace;
+      return t;
+    }
+    function drawAsphalt(ctx, w, h) {
+      ctx.fillStyle = '#2e2e31';
+      ctx.fillRect(0, 0, w, h);
+      for (let i = 0; i < w * h / 6; i++) {
+        const g = 30 + Math.floor(Math.random() * 30);
+        ctx.fillStyle = 'rgb(' + g + ',' + g + ',' + (g + 2) + ')';
+        ctx.fillRect(Math.random() * w, Math.random() * h, 1.5, 1.5);
+      }
+    }
+
+    // Shared wheel shapes
+    const wheelGeo = new THREE.CylinderGeometry(0.38, 0.38, 0.3, 14);
+    wheelGeo.rotateZ(Math.PI / 2);
+    const rimGeo = new THREE.CylinderGeometry(0.22, 0.22, 0.32, 10);
+    rimGeo.rotateZ(Math.PI / 2);
+    const bikeWheelGeo = new THREE.CylinderGeometry(0.35, 0.35, 0.14, 12);
+    bikeWheelGeo.rotateZ(Math.PI / 2);
+
+    function addWheel(parent, x, z, scale) {
+      const g = new THREE.Group();
+      g.position.set(x, 0.38 * scale, z);
+      g.scale.setScalar(scale);
+      g.add(new THREE.Mesh(wheelGeo, mat('#111111')));
+      g.add(new THREE.Mesh(rimGeo, mat('#bbbbbb')));
+      parent.add(g);
+    }
+
+    // =====================================================
+    // SECTION 3: VEHICLES, PEDESTRIANS (the shapes)
+    // The front of everything points to -z
+    // =====================================================
+    function makeCar(color) {
+      const g = new THREE.Group();
+      box(g, 1.7, 0.15, 4.0, 0, 0.3, 0, '#111111');           // underbody
+      box(g, 1.9, 0.55, 4.3, 0, 0.65, 0, color);               // main body
+      box(g, 1.8, 0.18, 1.3, 0, 0.97, -1.5, color);            // hood
+      box(g, 1.8, 0.2, 1.0, 0, 0.97, 1.6, color);              // trunk
+      box(g, 1.55, 0.5, 1.7, 0, 1.25, 0.2, '#1b2a36');         // glass cabin
+      box(g, 1.6, 0.07, 1.5, 0, 1.52, 0.2, color);             // roof
+      box(g, 0.4, 0.15, 0.05, -0.65, 0.75, -2.16, '#fff3b0', true);  // headlights
+      box(g, 0.4, 0.15, 0.05, 0.65, 0.75, -2.16, '#fff3b0', true);
+      box(g, 0.4, 0.15, 0.05, -0.7, 0.78, 2.16, '#ff2020', true);    // tail lights
+      box(g, 0.4, 0.15, 0.05, 0.7, 0.78, 2.16, '#ff2020', true);
+      addWheel(g, -1, -1.4, 1); addWheel(g, 1, -1.4, 1);
+      addWheel(g, -1, 1.4, 1);  addWheel(g, 1, 1.4, 1);
+      return g;
+    }
+
+    function makeBus(color) {
+      const g = new THREE.Group();
+      box(g, 2.5, 2.4, 10.5, 0, 1.6, 0, color);                // body
+      box(g, 2.54, 0.8, 9.6, 0, 2.1, 0, '#1b2a36');            // window band
+      box(g, 2.3, 1.1, 0.05, 0, 2.0, -5.27, '#1b2a36');        // windshield
+      box(g, 2.3, 0.1, 10, 0, 2.85, 0, '#dddddd');             // roof
+      box(g, 0.5, 0.2, 0.05, -0.8, 0.9, -5.27, '#fff3b0', true);
+      box(g, 0.5, 0.2, 0.05, 0.8, 0.9, -5.27, '#fff3b0', true);
+      addWheel(g, -1.2, -3.5, 1.3); addWheel(g, 1.2, -3.5, 1.3);
+      addWheel(g, -1.2, 3.2, 1.3);  addWheel(g, 1.2, 3.2, 1.3);
+      return g;
+    }
+
+    function makeBike(color) {
+      const g = new THREE.Group();
+      [-0.75, 0.75].forEach((z) => {
+        const w = new THREE.Mesh(bikeWheelGeo, mat('#111111'));
+        w.position.set(0, 0.35, z);
+        g.add(w);
+      });
+      box(g, 0.25, 0.35, 1.2, 0, 0.62, 0, color);              // frame
+      box(g, 0.3, 0.25, 0.5, 0, 0.9, -0.15, color);            // fuel tank
+      box(g, 0.25, 0.1, 0.55, 0, 0.88, 0.35, '#222222');       // seat
+      box(g, 0.7, 0.06, 0.06, 0, 1.1, -0.5, '#333333');        // handlebar
+      box(g, 0.2, 0.15, 0.05, 0, 0.85, -0.82, '#fff3b0', true);// headlight
+      // rider
+      box(g, 0.4, 0.6, 0.3, 0, 1.3, 0.15, pick(['#e63946', '#457b9d', '#2a9d8f', '#e9c46a', '#333333']));
+      box(g, 0.15, 0.5, 0.15, -0.2, 0.85, 0.05, '#1d3557');
+      box(g, 0.15, 0.5, 0.15, 0.2, 0.85, 0.05, '#1d3557');
+      const helmet = new THREE.Mesh(new THREE.SphereGeometry(0.19, 10, 8), mat(pick(['#ffffff', '#ffb703', '#e63946', '#111111'])));
+      helmet.position.set(0, 1.78, 0.1);
+      g.add(helmet);
+      return g;
+    }
+
+    const headGeo = new THREE.SphereGeometry(0.15, 10, 8);
+    function makePed() {
+      const g = new THREE.Group();
+      const shirt = pick(['#e63946', '#457b9d', '#2a9d8f', '#e9c46a', '#f4a261', '#6d597a', '#ffffff', '#3a3a3a']);
+      const pants = pick(['#1d3557', '#222222', '#5c4033', '#3d405b']);
+      const skin = pick(['#f1c27d', '#c68642', '#8d5524', '#e0ac69']);
+      box(g, 0.45, 0.62, 0.25, 0, 1.12, 0, shirt);             // body
+      const head = new THREE.Mesh(headGeo, mat(skin));
+      head.position.y = 1.6;
+      g.add(head);
+      g.legs = []; g.arms = [];
+      [-0.12, 0.12].forEach((x) => {                           // legs swing from the hip
+        const leg = new THREE.Group();
+        leg.position.set(x, 0.8, 0);
+        box(leg, 0.16, 0.8, 0.2, 0, -0.4, 0, pants);
+        g.add(leg); g.legs.push(leg);
+      });
+      [-0.3, 0.3].forEach((x) => {                             // arms swing from the shoulder
+        const arm = new THREE.Group();
+        arm.position.set(x, 1.4, 0);
+        box(arm, 0.12, 0.55, 0.14, 0, -0.27, 0, shirt);
+        g.add(arm); g.arms.push(arm);
+      });
+      return g;
+    }
+
+    // =====================================================
+    // SECTION 4: RAMPS
+    // =====================================================
     AFRAME.registerComponent('build-ramps', {
       init: function () {
         RAMPS.forEach((r) => {
@@ -56,22 +219,267 @@
       }
     });
 
-    // White dashed line in the middle of the road
-    AFRAME.registerComponent('road-lines', {
+    // =====================================================
+    // SECTION 5: THE CITY (road, sidewalks, buildings, street lights, trees)
+    // =====================================================
+    const BUILDING_STYLES = [
+      { wall: '#c8b9a6', glass: '#9fc3dc' },   // beige
+      { wall: '#8d96a1', glass: '#cfe6f5' },   // grey
+      { wall: '#a85a48', glass: '#d8e9f2' },   // brick red
+      { wall: '#d4cfc2', glass: '#7fa6c2' },   // cream
+      { wall: '#4e5d6b', glass: '#a8d0ea' }    // dark blue
+    ];
+
+    function inCrossStreet(z, pad) {
+      return CROSS_STREETS.some((c) => Math.abs(z - c) < 7 + pad);
+    }
+
+    AFRAME.registerComponent('city', {
       init: function () {
-        for (let i = 0; i < 60; i++) {
-          const dash = document.createElement('a-plane');
-          dash.setAttribute('rotation', '-90 0 0');
-          dash.setAttribute('position', `0 0.02 ${90 - i * 10}`);
-          dash.setAttribute('width', '0.3');
-          dash.setAttribute('height', '3');
-          dash.setAttribute('color', '#ffffff');
-          this.el.appendChild(dash);
+        const root = this.el.object3D;
+
+        // Draw the window pictures for each building style
+        BUILDING_STYLES.forEach((s) => {
+          s.canvas = makeCanvas(256, 256, (ctx) => {
+            ctx.fillStyle = s.wall;
+            ctx.fillRect(0, 0, 256, 256);
+            for (let row = 0; row < 4; row++) {
+              for (let col = 0; col < 4; col++) {
+                const x = col * 64, y = row * 64;
+                ctx.fillStyle = '#2b2b2b';
+                ctx.fillRect(x + 9, y + 9, 46, 46);                       // window frame
+                ctx.fillStyle = Math.random() < 0.25 ? '#ffe9a8' : s.glass; // some windows are lit
+                ctx.fillRect(x + 11, y + 11, 42, 42);                     // glass
+                ctx.fillStyle = '#2b2b2b';
+                ctx.fillRect(x + 31, y + 11, 2, 42);                      // window bar
+              }
+            }
+          });
+        });
+
+        function addBuilding(x, z, w, len, h, style) {
+          const texX = makeTex(style.canvas, Math.max(1, Math.round(len / 12)), Math.max(1, Math.round(h / 14)));
+          const texZ = makeTex(style.canvas, Math.max(1, Math.round(w / 12)), Math.max(1, Math.round(h / 14)));
+          const sideX = new THREE.MeshStandardMaterial({ map: texX, roughness: 0.8 });
+          const sideZ = new THREE.MeshStandardMaterial({ map: texZ, roughness: 0.8 });
+          const roof = mat('#555555');
+          const mesh = new THREE.Mesh(geo(w, h, len), [sideX, sideX, roof, roof, sideZ, sideZ]);
+          mesh.position.set(x, h / 2, z);
+          root.add(mesh);
+        }
+
+        // ----- Ground, road, markings -----
+        const ground = new THREE.Mesh(new THREE.PlaneGeometry(1400, 1600), new THREE.MeshStandardMaterial({ color: '#77786f', roughness: 1 }));
+        ground.rotation.x = -Math.PI / 2;
+        ground.position.set(0, -0.02, -290);
+        root.add(ground);
+
+        function flatPlane(w, l, tex, x, y, z, decal) {
+          const m = new THREE.Mesh(new THREE.PlaneGeometry(w, l), new THREE.MeshStandardMaterial({ map: tex, roughness: 0.95 }));
+          m.rotation.x = -Math.PI / 2;
+          m.position.set(x, y, z);
+          if (decal) {
+            m.material.transparent = true;
+            m.material.polygonOffset = true;
+            m.material.polygonOffsetFactor = -2;
+            m.material.polygonOffsetUnits = -2;
+          }
+          root.add(m);
+        }
+
+        // Main road: asphalt + double yellow centre line + white dashed lane lines + edge lines (one picture, repeated)
+        const roadCanvas = makeCanvas(512, 512, (ctx, w, h) => {
+          drawAsphalt(ctx, w, h);
+          ctx.fillStyle = '#e8b923';
+          ctx.fillRect(256 - 9, 0, 4, 512);
+          ctx.fillRect(256 + 5, 0, 4, 512);
+          ctx.fillStyle = '#f2f2f2';
+          for (let i = 0; i < 4; i++) {
+            ctx.fillRect(256 - 130, i * 128, 4, 64);
+            ctx.fillRect(256 + 126, i * 128, 4, 64);
+          }
+          ctx.fillRect(8, 0, 4, 512);
+          ctx.fillRect(500, 0, 4, 512);
+        });
+        flatPlane(20, LENGTH, makeTex(roadCanvas, 1, LENGTH / 24), 0, 0.01, (ROAD.zMax + ROAD.zMin) / 2, false);
+
+        // Side streets + zebra crossings
+        const asphaltCanvas = makeCanvas(256, 256, drawAsphalt);
+        const zebraCanvas = makeCanvas(512, 64, (ctx) => {
+          ctx.fillStyle = '#f2f2f2';
+          for (let m = 0.3; m < 20; m += 1.2) ctx.fillRect(m * 25.6, 0, 15.36, 64);
+        });
+        CROSS_STREETS.forEach((c) => {
+          flatPlane(240, 14, makeTex(asphaltCanvas, 30, 1.75), 0, 0.02, c, false);
+          flatPlane(20, 3, makeTex(zebraCanvas, 1, 1), 0, 0.03, c + 9.5, true);
+          flatPlane(20, 3, makeTex(zebraCanvas, 1, 1), 0, 0.03, c - 9.5, true);
+        });
+
+        // ----- Sidewalks (they stop at side streets) -----
+        const paveCanvas = makeCanvas(128, 128, (ctx) => {
+          ctx.fillStyle = '#b9b6ad';
+          ctx.fillRect(0, 0, 128, 128);
+          ctx.fillStyle = '#9a978f';
+          ctx.fillRect(0, 0, 128, 3);
+          ctx.fillRect(0, 0, 3, 128);
+        });
+        const sorted = [...CROSS_STREETS].sort((a, b) => b - a);
+        const segments = [];
+        let top = ROAD.zMax;
+        sorted.forEach((c) => { segments.push([top, c + 7]); top = c - 7; });
+        segments.push([top, ROAD.zMin]);
+
+        segments.forEach((seg) => {
+          const len = seg[0] - seg[1];
+          [-1, 1].forEach((side) => {
+            const topMat = new THREE.MeshStandardMaterial({ map: makeTex(paveCanvas, 2.25, len / 2), roughness: 0.9 });
+            const sideMat = mat('#8f8c84');
+            const s = new THREE.Mesh(geo(4.5, 0.18, len), [sideMat, sideMat, topMat, sideMat, sideMat, sideMat]);
+            s.position.set(side * 12.25, 0.09, (seg[0] + seg[1]) / 2);
+            root.add(s);
+          });
+        });
+
+        // ----- Buildings on both sides -----
+        [-1, 1].forEach((side) => {
+          let z = ROAD.zMax - 5;
+          while (z > ROAD.zMin + 20) {
+            const len = 12 + Math.random() * 10;
+            const zc = z - len / 2;
+            const hit = CROSS_STREETS.find((c) => zc + len / 2 > c - 7.5 && zc - len / 2 < c + 7.5);
+            if (hit !== undefined) { z = hit - 7.6; continue; }   // leave a gap for the side street
+            const w = 14 + Math.random() * 10;
+            const h = 14 + Math.pow(Math.random(), 1.6) * 50;
+            addBuilding(side * (14.5 + w / 2), zc, w, len, h, pick(BUILDING_STYLES));
+            z -= len + 0.5 + Math.random() * 1.5;
+          }
+        });
+        // Big buildings that close off both ends of the street
+        addBuilding(0, ROAD.zMin - 15, 80, 30, 55, BUILDING_STYLES[4]);
+        addBuilding(0, ROAD.zMax + 15, 80, 30, 55, BUILDING_STYLES[1]);
+
+        // ----- Street lights and trees on the sidewalks -----
+        function addStreetLight(x, z) {
+          const dir = x < 0 ? 1 : -1;                          // arm reaches towards the road
+          box(root, 0.15, 7, 0.15, x, 3.5, z, '#444444');
+          box(root, 2, 0.12, 0.12, x + dir * 1, 7, z, '#444444');
+          box(root, 0.6, 0.1, 0.3, x + dir * 1.8, 6.92, z, '#fff6c9', true);
+        }
+        const leafGeo = new THREE.SphereGeometry(1.6, 8, 6);
+        function addTree(x, z) {
+          box(root, 0.3, 2.5, 0.3, x, 1.25, z, '#6b4a2b');
+          const leaves = new THREE.Mesh(leafGeo, mat('#2e7d32'));
+          leaves.position.set(x, 3.8, z);
+          root.add(leaves);
+        }
+        for (let z = ROAD.zMax - 10; z > ROAD.zMin + 10; z -= 32) {
+          if (!inCrossStreet(z, 2)) addStreetLight(-10.8, z);
+          if (!inCrossStreet(z - 16, 2)) addStreetLight(10.8, z - 16);
+          if (!inCrossStreet(z - 8, 2)) addTree(-13.2, z - 8);
+          if (!inCrossStreet(z - 24, 2)) addTree(13.2, z - 24);
         }
       }
     });
 
-    // ---------- 3. WHEEL (tire + rim + spokes, so you can see it spin) ----------
+    // =====================================================
+    // SECTION 6: TRAFFIC (cars, buses, bikes)
+    // Left-hand traffic like India: our side goes towards -z, the other side comes towards us.
+    // The far-left lane (x = -7.5) is kept empty for overtaking and for the ramps.
+    // =====================================================
+    AFRAME.registerComponent('traffic', {
+      init: function () {
+        const root = this.el.object3D;
+        const lanes = [
+          { x: -2.5, dir: -1, speed: 9 },    // same direction, slow
+          { x: 2.5,  dir: 1,  speed: 13 },   // coming towards you
+          { x: 7.5,  dir: 1,  speed: 17 }    // coming towards you, faster
+        ];
+        const colors = ['#e63946', '#f1faee', '#1d3557', '#ffb703', '#2a9d8f', '#6c757d', '#ffffff', '#111111', '#8338ec', '#fb8500'];
+        this.period = LENGTH - 10;           // vehicles wrap around inside this length
+        const spacing = this.period / TRAFFIC_PER_LANE;
+
+        lanes.forEach((lane) => {
+          for (let i = 0; i < TRAFFIC_PER_LANE; i++) {
+            const roll = Math.random();
+            let obj, hw, hl, x = lane.x;
+            if (roll < 0.1) {
+              obj = makeBus(pick(['#1e88e5', '#e53935', '#43a047']));
+              hw = 1.25; hl = 5.25;
+            } else if (roll < 0.35) {
+              obj = makeBike(pick(colors));
+              hw = 0.4; hl = 1.1;
+              x += (Math.random() - 0.5) * 1.6;
+            } else {
+              obj = makeCar(pick(colors));
+              hw = 0.95; hl = 2.15;
+            }
+            if (lane.dir > 0) obj.rotation.y = Math.PI;      // turn around if driving towards +z
+            const z = (ROAD.zMax - 5) - 30 - i * spacing - Math.random() * 8;
+            obj.position.set(x, 0, z);
+            root.add(obj);
+
+            const v = { obj: obj, x: x, z: z, dir: lane.dir, speed: lane.speed, hw: hw, hl: hl };
+            trafficList.push(v);
+          }
+        });
+      },
+
+      tick: function (time, delta) {
+        const dt = Math.min(delta / 1000, 0.05);
+        const zTop = ROAD.zMax - 5, zBottom = ROAD.zMin + 5;
+        for (const v of trafficList) {
+          v.z += v.dir * v.speed * dt;
+          if (v.dir < 0 && v.z < zBottom) v.z += this.period;   // wrap around
+          if (v.dir > 0 && v.z > zTop) v.z -= this.period;
+          v.obj.position.z = v.z;
+        }
+      }
+    });
+
+    // =====================================================
+    // SECTION 7: PEDESTRIANS (walk along the sidewalks)
+    // =====================================================
+    AFRAME.registerComponent('pedestrians', {
+      init: function () {
+        this.peds = [];
+        for (let i = 0; i < PEDESTRIAN_COUNT; i++) {
+          const side = i % 2 === 0 ? 1 : -1;
+          const g = makePed();
+          const ped = {
+            obj: g,
+            x: side * (11 + Math.random() * 2.5),
+            z: ROAD.zMin + 20 + Math.random() * (LENGTH - 30),
+            dir: Math.random() < 0.5 ? 1 : -1,
+            speed: 1.2 + Math.random() * 0.8,
+            phase: Math.random() * 6
+          };
+          g.position.set(ped.x, 0.18, ped.z);
+          this.el.object3D.add(g);
+          this.peds.push(ped);
+        }
+      },
+
+      tick: function (time, delta) {
+        const dt = Math.min(delta / 1000, 0.05);
+        for (const p of this.peds) {
+          p.z += p.dir * p.speed * dt;
+          if (p.z < ROAD.zMin + 15) p.dir = 1;                  // turn around at the ends
+          if (p.z > ROAD.zMax - 5) p.dir = -1;
+          p.phase += p.speed * dt * 4;
+          const swing = Math.sin(p.phase) * 0.6;
+          p.obj.legs[0].rotation.x = swing;
+          p.obj.legs[1].rotation.x = -swing;
+          p.obj.arms[0].rotation.x = -swing;
+          p.obj.arms[1].rotation.x = swing;
+          p.obj.rotation.y = p.dir < 0 ? 0 : Math.PI;           // face the way they walk
+          p.obj.position.z = p.z;
+        }
+      }
+    });
+
+    // =====================================================
+    // SECTION 8: WHEEL FOR THE PLAYER CAR (tire + rim + spokes)
+    // =====================================================
     AFRAME.registerComponent('wheel', {
       init: function () {
         const spin = document.createElement('a-entity');
@@ -86,19 +494,25 @@
       }
     });
 
-    // ---------- 4. CAR CONTROLS ----------
+    // =====================================================
+    // SECTION 9: PLAYER CAR CONTROLS
+    // =====================================================
     AFRAME.registerComponent('car-controls', {
       init: function () {
         this.speed = 0;
-        this.vy = 0;              // up/down speed (for jumps)
+        this.vy = 0;
         this.airborne = false;
-        this.steer = 0;           // -1 right ... +1 left
-        this.pitch = 0;           // nose up/down
-        this.boost = 100;         // boost meter
+        this.steer = 0;
+        this.pitch = 0;
+        this.boost = 100;
+        this.crashes = 0;
+        this.crashTimer = 0;
+        this.lastBraking = false;
 
         this.keys = {};
         this.speedText = document.getElementById('speed');
         this.boostBar = document.getElementById('boostFill');
+        this.crashText = document.getElementById('crash');
         this.camEl = document.getElementById('cam');
 
         window.addEventListener('keydown', (e) => {
@@ -120,12 +534,13 @@
           this.spins = [...this.el.querySelectorAll('.spin')].map((e) => e.object3D);
           this.steers = [...this.el.querySelectorAll('.steer')].map((e) => e.object3D);
           this.flames = [...this.el.querySelectorAll('.flame')].map((e) => e.object3D);
+          this.brakeLights = [...this.el.querySelectorAll('.brake')];
           return;
         }
 
-        // Press R to reset the car
+        // R = back to the start
         if (k.KeyR) {
-          p.set(0, 0, 0);
+          p.set(-2.5, 0, 52);
           car.rotation.y = 0;
           this.speed = 0; this.vy = 0; this.airborne = false; this.boost = 100;
         }
@@ -136,29 +551,21 @@
         const wantsBoost = k.ShiftLeft || k.ShiftRight || k.Space;
         const boosting = wantsBoost && this.boost > 0;
 
-        if (boosting) {
-          this.boost = Math.max(0, this.boost - 30 * dt);
-        } else if (!wantsBoost) {
-          this.boost = Math.min(100, this.boost + 8 * dt);   // recharge slowly
-        }
+        if (boosting) this.boost = Math.max(0, this.boost - 30 * dt);
+        else if (!wantsBoost) this.boost = Math.min(100, this.boost + 8 * dt);
 
         const maxSpeed = boosting ? 38 : 20;
 
         if (boosting) this.speed += 30 * dt;
         else if (gas) this.speed += 12 * dt;
-
         if (brake) this.speed -= (this.speed > 0 ? 25 : 10) * dt;
 
-        // Slow down by itself when no pedal is pressed
-        if (!gas && !brake && !boosting && !this.airborne) {
-          this.speed -= this.speed * 0.8 * dt;
-        }
+        if (!gas && !brake && !boosting && !this.airborne) this.speed -= this.speed * 0.8 * dt;
 
-        // Limits
         if (this.speed > maxSpeed) this.speed = Math.max(maxSpeed, this.speed - 15 * dt);
         if (this.speed < -6) this.speed = -6;
 
-        // --- Steering (smooth, and gets gentler at high speed) ---
+        // --- Steering ---
         let target = 0;
         if (k.ArrowLeft || k.KeyA) target = 1;
         if (k.ArrowRight || k.KeyD) target = -1;
@@ -170,56 +577,83 @@
           car.rotation.y += this.steer * turnRate * dt * direction;
         }
 
-        // --- Move forward ---
+        // --- Move ---
         const oldX = p.x, oldZ = p.z, oldY = p.y;
         p.x -= Math.sin(car.rotation.y) * this.speed * dt;
         p.z -= Math.cos(car.rotation.y) * this.speed * dt;
+
+        // Curb on both sides and the ends of the street
+        if (p.x < -9.4) { p.x = -9.4; this.speed *= 0.98; }
+        if (p.x > 9.4) { p.x = 9.4; this.speed *= 0.98; }
+        if (p.z > 55) { p.z = 55; this.speed *= 0.5; }
+        if (p.z < ROAD.zMin + 12) { p.z = ROAD.zMin + 12; this.speed *= 0.5; }
+
+        // Crash into traffic?
+        if (p.y < 2) {
+          for (const v of trafficList) {
+            const dx = p.x - v.x, dz = p.z - v.z;
+            if (Math.abs(dx) < v.hw + 1.0 && Math.abs(dz) < v.hl + 2.2) {
+              p.x = oldX; p.z = oldZ;
+              p.z += v.dir * v.speed * dt * 1.2;      // get pushed along by the other vehicle
+              this.speed *= -0.25;
+              if (this.crashTimer <= 0) {
+                this.crashes++;
+                this.crashTimer = 0.8;
+                this.crashText.style.display = 'block';
+              }
+              break;
+            }
+          }
+        }
+        if (this.crashTimer > 0) {
+          this.crashTimer -= dt;
+          if (this.crashTimer <= 0) this.crashText.style.display = 'none';
+        }
 
         // --- Ramps and jumping ---
         const ground = getGroundHeight(p.x, p.z);
 
         if (!this.airborne && ground - p.y > 0.6) {
-          // Hit the back or side of a ramp: bounce off
           p.x = oldX; p.z = oldZ;
           this.speed *= -0.3;
         } else if (this.airborne) {
-          this.vy -= 20 * dt;               // gravity
+          this.vy -= 20 * dt;
           p.y += this.vy * dt;
-          if (p.y <= ground) {              // landed
-            p.y = ground;
-            this.vy = 0;
-            this.airborne = false;
-          }
+          if (p.y <= ground) { p.y = ground; this.vy = 0; this.airborne = false; }
         } else if (ground >= p.y - 0.05) {
-          // Driving on the ground or up a ramp
           p.y = ground;
-          this.vy = (ground - oldY) / dt;   // remember how fast we're going up
+          this.vy = (ground - oldY) / dt;
         } else {
-          // Ground dropped away (end of ramp): take off!
           this.airborne = true;
         }
 
-        // --- Make the car look realistic ---
-        // Nose tilts up on ramps and down when falling
+        // --- Car body movement ---
         const forward = Math.max(Math.abs(this.speed), 3);
-        const targetPitch = Math.atan2(this.vy, forward) * (this.speed >= 0 ? 1 : -1);
+        let targetPitch = Math.atan2(this.vy, forward) * (this.speed >= 0 ? 1 : -1);
+        if (!this.airborne) {
+          if (brake && this.speed > 1) targetPitch -= 0.03;            // nose dips when braking
+          else if (gas || boosting) targetPitch += 0.02;               // nose lifts when accelerating
+        }
         this.pitch += (targetPitch - this.pitch) * Math.min(1, 8 * dt);
         this.chassis.rotation.x = this.pitch;
-
-        // Body leans in corners
         this.chassis.rotation.z = -this.steer * Math.min(Math.abs(this.speed), 25) * 0.004;
 
-        // Wheels spin and front wheels turn
         this.spins.forEach((s) => { s.rotation.x -= this.speed * dt / 0.38; });
         this.steers.forEach((s) => { s.rotation.y = this.steer * 0.5; });
 
-        // Boost flames at the back
         this.flames.forEach((f) => {
           f.visible = boosting;
           f.scale.y = 0.8 + Math.random() * 0.8;
         });
 
-        // Camera zooms out a bit when boosting (feels faster)
+        // Brake lights get brighter when you brake
+        const braking = !!(brake && this.speed > 0.5);
+        if (braking !== this.lastBraking) {
+          this.brakeLights.forEach((el) => el.setAttribute('material', 'color', braking ? '#ff0000' : '#a01010'));
+          this.lastBraking = braking;
+        }
+
+        // Camera zooms out when boosting
         const cam = this.camEl.getObject3D('camera');
         if (cam) {
           const targetFov = boosting ? 85 : 70;
@@ -227,8 +661,8 @@
           cam.updateProjectionMatrix();
         }
 
-        // --- Update the on-screen info ---
-        this.speedText.textContent = 'Speed: ' + Math.round(Math.abs(this.speed) * 5) + ' km/h';
+        // --- On-screen info ---
+        this.speedText.textContent = 'Speed: ' + Math.round(Math.abs(this.speed) * 5) + ' km/h   |   Crashes: ' + this.crashes;
         this.boostBar.style.width = this.boost + '%';
       }
     });
@@ -248,6 +682,10 @@
       color: white; font: 14px Arial, sans-serif;
       background: rgba(0, 0, 0, 0.55); padding: 8px 12px; border-radius: 8px;
     }
+    #crash {
+      display: none; position: fixed; top: 40%; left: 50%; transform: translate(-50%, -50%); z-index: 10;
+      color: #ff3b3b; font: bold 48px Arial, sans-serif; text-shadow: 0 0 10px black;
+    }
   </style>
 </head>
 
@@ -257,49 +695,41 @@
     <div>Boost</div>
     <div id="boostBack"><div id="boostFill"></div></div>
   </div>
-  <div id="help">W/S = gas/brake &nbsp; A/D = steer &nbsp; Shift or Space = boost &nbsp; R = reset</div>
+  <div id="crash">CRASH!</div>
+  <div id="help">W/S = gas/brake &nbsp; A/D = steer &nbsp; Shift or Space = boost &nbsp; R = reset &nbsp; Ramps are in the far-left lane</div>
 
-  <a-scene fog="type: linear; color: #87ceeb; near: 60; far: 350">
+  <a-scene renderer="logarithmicDepthBuffer: true; antialias: true" fog="type: linear; color: #a9cce8; near: 80; far: 420">
     <!-- Lights -->
-    <a-entity light="type: ambient; color: #ffffff; intensity: 0.7"></a-entity>
-    <a-entity light="type: directional; color: #ffffff; intensity: 0.8" position="-5 10 5"></a-entity>
+    <a-entity light="type: hemisphere; color: #ffffff; groundColor: #777777; intensity: 0.9"></a-entity>
+    <a-entity light="type: directional; color: #fff4e0; intensity: 0.9" position="30 60 20"></a-entity>
 
-    <!-- Sky, ground, road -->
-    <a-sky color="#87ceeb"></a-sky>
-    <a-plane rotation="-90 0 0" width="800" height="800" color="#4a8f3c"></a-plane>
-    <a-plane rotation="-90 0 0" position="0 0.01 -200" width="10" height="600" color="#333"></a-plane>
-    <a-entity road-lines></a-entity>
+    <a-sky color="#a9cce8"></a-sky>
+
+    <!-- The city: road, buildings, lights, trees -->
+    <a-entity city></a-entity>
 
     <!-- Ramps -->
     <a-entity build-ramps></a-entity>
 
-    <!-- Scenery -->
-    <a-box position="8 1 -20" width="2" height="2" depth="2" color="#e74c3c"></a-box>
-    <a-box position="-8 1 -45" width="2" height="2" depth="2" color="#9b59b6"></a-box>
-    <a-cylinder position="12 2 -10" radius="0.5" height="4" color="#8b5a2b"></a-cylinder>
-    <a-sphere position="12 5 -10" radius="2" color="#2e7d32"></a-sphere>
-    <a-cylinder position="-12 2 -30" radius="0.5" height="4" color="#8b5a2b"></a-cylinder>
-    <a-sphere position="-12 5 -30" radius="2" color="#2e7d32"></a-sphere>
-    <a-cylinder position="13 2 -110" radius="0.5" height="4" color="#8b5a2b"></a-cylinder>
-    <a-sphere position="13 5 -110" radius="2" color="#2e7d32"></a-sphere>
-    <a-cylinder position="-13 2 -140" radius="0.5" height="4" color="#8b5a2b"></a-cylinder>
-    <a-sphere position="-13 5 -140" radius="2" color="#2e7d32"></a-sphere>
+    <!-- Traffic and people -->
+    <a-entity traffic></a-entity>
+    <a-entity pedestrians></a-entity>
 
-    <!-- THE CAR (front of the car points to -z) -->
-    <a-entity id="car" car-controls position="0 0 0">
+    <!-- THE PLAYER CAR (front of the car points to -z) -->
+    <a-entity id="car" car-controls position="-2.5 0 52">
       <a-entity id="chassis">
 
         <!-- Underbody -->
         <a-box position="0 0.3 0" width="1.7" height="0.15" depth="4" color="#111"></a-box>
 
         <!-- Main body, hood, trunk -->
-        <a-box position="0 0.65 0" width="1.9" height="0.55" depth="4.4" color="#c1121f" metalness="0.6" roughness="0.3"></a-box>
-        <a-box position="0 0.95 -1.5" width="1.8" height="0.15" depth="1.3" color="#c1121f" metalness="0.6" roughness="0.3"></a-box>
-        <a-box position="0 0.95 1.6" width="1.8" height="0.15" depth="1.0" color="#c1121f" metalness="0.6" roughness="0.3"></a-box>
+        <a-box position="0 0.62 0" width="1.9" height="0.5" depth="4.4" color="#c1121f" metalness="0.5" roughness="0.3"></a-box>
+        <a-box position="0 0.93 -1.45" width="1.84" height="0.18" depth="1.5" color="#c1121f" metalness="0.5" roughness="0.3"></a-box>
+        <a-box position="0 0.95 1.55" width="1.84" height="0.2" depth="1.1" color="#c1121f" metalness="0.5" roughness="0.3"></a-box>
 
         <!-- Cabin (dark glass) and roof -->
-        <a-box position="0 1.2 0.25" width="1.5" height="0.5" depth="1.4" color="#10202b" metalness="0.8" roughness="0.1"></a-box>
-        <a-box position="0 1.5 0.25" width="1.55" height="0.08" depth="1.3" color="#c1121f" metalness="0.6" roughness="0.3"></a-box>
+        <a-box position="0 1.2 0.2" width="1.5" height="0.5" depth="1.5" color="#10202b" metalness="0.8" roughness="0.1"></a-box>
+        <a-box position="0 1.48 0.2" width="1.54" height="0.07" depth="1.3" color="#c1121f" metalness="0.5" roughness="0.3"></a-box>
 
         <!-- Windshield and rear window -->
         <a-box position="0 1.2 -0.78" rotation="-38 0 0" width="1.5" height="0.04" depth="0.82"
@@ -307,15 +737,39 @@
         <a-box position="0 1.2 1.18" rotation="48 0 0" width="1.5" height="0.04" depth="0.67"
                color="#7fb7d9" opacity="0.65" transparent="true"></a-box>
 
-        <!-- Bumpers -->
-        <a-box position="0 0.45 -2.25" width="1.95" height="0.25" depth="0.15" color="#222"></a-box>
-        <a-box position="0 0.45 2.25" width="1.95" height="0.25" depth="0.15" color="#222"></a-box>
+        <!-- Wheel arches (dark patches behind the wheels) -->
+        <a-box position="-0.97 0.5 -1.4" width="0.1" height="0.8" depth="1.0" color="#0a0a0a"></a-box>
+        <a-box position="0.97 0.5 -1.4" width="0.1" height="0.8" depth="1.0" color="#0a0a0a"></a-box>
+        <a-box position="-0.97 0.5 1.4" width="0.1" height="0.8" depth="1.0" color="#0a0a0a"></a-box>
+        <a-box position="0.97 0.5 1.4" width="0.1" height="0.8" depth="1.0" color="#0a0a0a"></a-box>
 
-        <!-- Lights -->
-        <a-box position="-0.65 0.72 -2.21" width="0.4" height="0.15" depth="0.05" material="shader: flat; color: #fff7b0"></a-box>
-        <a-box position="0.65 0.72 -2.21" width="0.4" height="0.15" depth="0.05" material="shader: flat; color: #fff7b0"></a-box>
-        <a-box position="-0.7 0.75 2.21" width="0.4" height="0.15" depth="0.05" material="shader: flat; color: #ff2020"></a-box>
-        <a-box position="0.7 0.75 2.21" width="0.4" height="0.15" depth="0.05" material="shader: flat; color: #ff2020"></a-box>
+        <!-- Door lines and handles -->
+        <a-box position="-0.96 0.75 -0.3" width="0.02" height="0.4" depth="0.03" color="#400"></a-box>
+        <a-box position="0.96 0.75 -0.3" width="0.02" height="0.4" depth="0.03" color="#400"></a-box>
+        <a-box position="-0.96 0.75 0.9" width="0.02" height="0.4" depth="0.03" color="#400"></a-box>
+        <a-box position="0.96 0.75 0.9" width="0.02" height="0.4" depth="0.03" color="#400"></a-box>
+        <a-box position="-0.97 0.85 0.1" width="0.03" height="0.04" depth="0.2" color="#ccc"></a-box>
+        <a-box position="0.97 0.85 0.1" width="0.03" height="0.04" depth="0.2" color="#ccc"></a-box>
+
+        <!-- Side mirrors -->
+        <a-box position="-1.05 1.05 -0.55" width="0.25" height="0.12" depth="0.1" color="#c1121f"></a-box>
+        <a-box position="1.05 1.05 -0.55" width="0.25" height="0.12" depth="0.1" color="#c1121f"></a-box>
+
+        <!-- Front: grille, bumper, number plate, headlights -->
+        <a-box position="0 0.42 -2.22" width="1.95" height="0.28" depth="0.2" color="#222"></a-box>
+        <a-box position="0 0.55 -2.3" width="1.0" height="0.18" depth="0.05" color="#050505"></a-box>
+        <a-box position="0 0.38 -2.34" width="0.5" height="0.14" depth="0.03" color="#f5f5f5"></a-box>
+        <a-box position="-0.65 0.75 -2.21" width="0.4" height="0.15" depth="0.05" material="shader: flat; color: #fff7b0"></a-box>
+        <a-box position="0.65 0.75 -2.21" width="0.4" height="0.15" depth="0.05" material="shader: flat; color: #fff7b0"></a-box>
+        <a-box position="0 0.78 -2.21" width="0.5" height="0.04" depth="0.05" material="shader: flat; color: #ffffff"></a-box>
+
+        <!-- Back: bumper, number plate, tail lights (class brake = they get brighter when braking), exhausts -->
+        <a-box position="0 0.42 2.25" width="1.95" height="0.28" depth="0.2" color="#222"></a-box>
+        <a-box position="0 0.5 2.36" width="0.5" height="0.14" depth="0.03" color="#f5f5f5"></a-box>
+        <a-box class="brake" position="-0.7 0.8 2.21" width="0.45" height="0.15" depth="0.05" material="shader: flat; color: #a01010"></a-box>
+        <a-box class="brake" position="0.7 0.8 2.21" width="0.45" height="0.15" depth="0.05" material="shader: flat; color: #a01010"></a-box>
+        <a-cylinder position="-0.5 0.28 2.35" rotation="90 0 0" radius="0.06" height="0.2" color="#999" metalness="0.9"></a-cylinder>
+        <a-cylinder position="0.5 0.28 2.35" rotation="90 0 0" radius="0.06" height="0.2" color="#999" metalness="0.9"></a-cylinder>
 
         <!-- Spoiler -->
         <a-box position="-0.6 1.07 2.0" width="0.08" height="0.25" depth="0.1" color="#111"></a-box>
@@ -328,15 +782,15 @@
         <a-entity wheel position="-1 0.38 1.4"></a-entity>
         <a-entity wheel position="1 0.38 1.4"></a-entity>
 
-        <!-- Boost flames (only show while boosting) -->
-        <a-cone class="flame" visible="false" position="-0.5 0.5 2.7" rotation="90 0 0"
+        <!-- Boost flames -->
+        <a-cone class="flame" visible="false" position="-0.5 0.5 2.8" rotation="90 0 0"
                 radius-bottom="0.15" radius-top="0" height="0.9" material="shader: flat; color: #ff8c00"></a-cone>
-        <a-cone class="flame" visible="false" position="0.5 0.5 2.7" rotation="90 0 0"
+        <a-cone class="flame" visible="false" position="0.5 0.5 2.8" rotation="90 0 0"
                 radius-bottom="0.15" radius-top="0" height="0.9" material="shader: flat; color: #ff8c00"></a-cone>
       </a-entity>
 
       <!-- Camera follows the car from behind -->
-      <a-camera id="cam" position="0 4 9" rotation="-15 0 0"
+      <a-camera id="cam" near="0.1" far="900" position="0 4 9" rotation="-15 0 0"
                 look-controls="enabled: false"
                 wasd-controls="enabled: false"></a-camera>
     </a-entity>
