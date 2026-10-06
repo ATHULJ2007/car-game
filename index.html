@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>3D Car Game - Ramps and Boost</title>
+  <script src="https://aframe.io/releases/1.5.0/aframe.min.js"></script>
+
+  <script>
+    // ---------- 1. RAMP DATA ----------
+    // x, z = where the ramp sits | w = width | l = length | h = height at the top
+    // Ramps rise as you drive forward (towards -z). Change these numbers to move or resize them.
+    const RAMPS = [
+      { x: 0, z: -60,  w: 6, l: 14, h: 3.5 },
+      { x: 0, z: -170, w: 6, l: 20, h: 6 },
+      { x: 0, z: -300, w: 7, l: 26, h: 9 }
+    ];
+
+    // Tells us how high the ground is at any (x, z) spot
+    function getGroundHeight(x, z) {
+      let height = 0;
+      for (const r of RAMPS) {
+        const insideWidth = Math.abs(x - r.x) <= r.w / 2;
+        const insideLength = z <= r.z + r.l / 2 && z >= r.z - r.l / 2;
+        if (insideWidth && insideLength) {
+          const t = (r.z + r.l / 2 - z) / r.l;   // 0 at the bottom, 1 at the top
+          height = Math.max(height, t * r.h);
+        }
+      }
+      return height;
+    }
+
+    // ---------- 2. BUILD THE RAMPS ----------
+    AFRAME.registerComponent('build-ramps', {
+      init: function () {
+        RAMPS.forEach((r) => {
+          const angle = Math.atan2(r.h, r.l);
+          const deg = angle * 180 / Math.PI;
+          const slopeLength = Math.sqrt(r.l * r.l + r.h * r.h);
+          const y = r.h / 2 - 0.15 * Math.cos(angle);
+
+          const ramp = document.createElement('a-entity');
+          ramp.innerHTML = `
+            <a-box position="${r.x} ${y} ${r.z}" rotation="${deg} 0 0"
+                   width="${r.w}" height="0.3" depth="${slopeLength}" color="#f4a300"></a-box>
+            <a-triangle position="${r.x - r.w / 2} 0 ${r.z}"
+                   vertex-a="0 0 ${r.l / 2}" vertex-b="0 0 ${-r.l / 2}" vertex-c="0 ${r.h} ${-r.l / 2}"
+                   material="side: double; color: #7a5200"></a-triangle>
+            <a-triangle position="${r.x + r.w / 2} 0 ${r.z}"
+                   vertex-a="0 0 ${r.l / 2}" vertex-b="0 0 ${-r.l / 2}" vertex-c="0 ${r.h} ${-r.l / 2}"
+                   material="side: double; color: #7a5200"></a-triangle>
+            <a-plane position="${r.x} ${r.h / 2} ${r.z - r.l / 2}"
+                   width="${r.w}" height="${r.h}" material="side: double; color: #7a5200"></a-plane>
+          `;
+          this.el.appendChild(ramp);
+        });
+      }
+    });
+
+    // White dashed line in the middle of the road
+    AFRAME.registerComponent('road-lines', {
+      init: function () {
+        for (let i = 0; i < 60; i++) {
+          const dash = document.createElement('a-plane');
+          dash.setAttribute('rotation', '-90 0 0');
+          dash.setAttribute('position', `0 0.02 ${90 - i * 10}`);
+          dash.setAttribute('width', '0.3');
+          dash.setAttribute('height', '3');
+          dash.setAttribute('color', '#ffffff');
+          this.el.appendChild(dash);
+        }
+      }
+    });
+
+    // ---------- 3. WHEEL (tire + rim + spokes, so you can see it spin) ----------
+    AFRAME.registerComponent('wheel', {
+      init: function () {
+        const spin = document.createElement('a-entity');
+        spin.setAttribute('class', 'spin');
+        spin.innerHTML = `
+          <a-cylinder rotation="0 0 90" radius="0.38" height="0.3" color="#111"></a-cylinder>
+          <a-cylinder rotation="0 0 90" radius="0.22" height="0.32" color="#bbb" metalness="0.9" roughness="0.2"></a-cylinder>
+          <a-box width="0.34" height="0.4" depth="0.06" color="#555"></a-box>
+          <a-box width="0.34" height="0.06" depth="0.4" color="#555"></a-box>
+        `;
+        this.el.appendChild(spin);
+      }
+    });
+
+    // ---------- 4. CAR CONTROLS ----------
+    AFRAME.registerComponent('car-controls', {
+      init: function () {
+        this.speed = 0;
+        this.vy = 0;              // up/down speed (for jumps)
+        this.airborne = false;
+        this.steer = 0;           // -1 right ... +1 left
+        this.pitch = 0;           // nose up/down
+        this.boost = 100;         // boost meter
+
+        this.keys = {};
+        this.speedText = document.getElementById('speed');
+        this.boostBar = document.getElementById('boostFill');
+        this.camEl = document.getElementById('cam');
+
+        window.addEventListener('keydown', (e) => {
+          this.keys[e.code] = true;
+          if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) e.preventDefault();
+        });
+        window.addEventListener('keyup', (e) => { this.keys[e.code] = false; });
+      },
+
+      tick: function (time, delta) {
+        const dt = Math.min(delta / 1000, 0.05);
+        const k = this.keys;
+        const car = this.el.object3D;
+        const p = car.position;
+
+        // Grab the car parts once they are ready
+        if (!this.spins || this.spins.length < 4) {
+          this.chassis = this.el.querySelector('#chassis').object3D;
+          this.spins = [...this.el.querySelectorAll('.spin')].map((e) => e.object3D);
+          this.steers = [...this.el.querySelectorAll('.steer')].map((e) => e.object3D);
+          this.flames = [...this.el.querySelectorAll('.flame')].map((e) => e.object3D);
+          return;
+        }
+
+        // Press R to reset the car
+        if (k.KeyR) {
+          p.set(0, 0, 0);
+          car.rotation.y = 0;
+          this.speed = 0; this.vy = 0; this.airborne = false; this.boost = 100;
+        }
+
+        // --- Gas, brake, boost ---
+        const gas = k.ArrowUp || k.KeyW;
+        const brake = k.ArrowDown || k.KeyS;
+        const wantsBoost = k.ShiftLeft || k.ShiftRight || k.Space;
+        const boosting = wantsBoost && this.boost > 0;
+
+        if (boosting) {
+          this.boost = Math.max(0, this.boost - 30 * dt);
+        } else if (!wantsBoost) {
+          this.boost = Math.min(100, this.boost + 8 * dt);   // recharge slowly
+        }
+
+        const maxSpeed = boosting ? 38 : 20;
+
+        if (boosting) this.speed += 30 * dt;
+        else if (gas) this.speed += 12 * dt;
+
+        if (brake) this.speed -= (this.speed > 0 ? 25 : 10) * dt;
+
+        // Slow down by itself when no pedal is pressed
+        if (!gas && !brake && !boosting && !this.airborne) {
+          this.speed -= this.speed * 0.8 * dt;
+        }
+
+        // Limits
+        if (this.speed > maxSpeed) this.speed = Math.max(maxSpeed, this.speed - 15 * dt);
+        if (this.speed < -6) this.speed = -6;
+
+        // --- Steering (smooth, and gets gentler at high speed) ---
+        let target = 0;
+        if (k.ArrowLeft || k.KeyA) target = 1;
+        if (k.ArrowRight || k.KeyD) target = -1;
+        this.steer += (target - this.steer) * Math.min(1, 8 * dt);
+
+        if (Math.abs(this.speed) > 0.3) {
+          const direction = this.speed > 0 ? 1 : -1;
+          const turnRate = 2.0 - Math.min(Math.abs(this.speed), 30) * 0.03;
+          car.rotation.y += this.steer * turnRate * dt * direction;
+        }
+
+        // --- Move forward ---
+        const oldX = p.x, oldZ = p.z, oldY = p.y;
+        p.x -= Math.sin(car.rotation.y) * this.speed * dt;
+        p.z -= Math.cos(car.rotation.y) * this.speed * dt;
+
+        // --- Ramps and jumping ---
+        const ground = getGroundHeight(p.x, p.z);
+
+        if (!this.airborne && ground - p.y > 0.6) {
+          // Hit the back or side of a ramp: bounce off
+          p.x = oldX; p.z = oldZ;
+          this.speed *= -0.3;
+        } else if (this.airborne) {
+          this.vy -= 20 * dt;               // gravity
+          p.y += this.vy * dt;
+          if (p.y <= ground) {              // landed
+            p.y = ground;
+            this.vy = 0;
+            this.airborne = false;
+          }
+        } else if (ground >= p.y - 0.05) {
+          // Driving on the ground or up a ramp
+          p.y = ground;
+          this.vy = (ground - oldY) / dt;   // remember how fast we're going up
+        } else {
+          // Ground dropped away (end of ramp): take off!
+          this.airborne = true;
+        }
+
+        // --- Make the car look realistic ---
+        // Nose tilts up on ramps and down when falling
+        const forward = Math.max(Math.abs(this.speed), 3);
+        const targetPitch = Math.atan2(this.vy, forward) * (this.speed >= 0 ? 1 : -1);
+        this.pitch += (targetPitch - this.pitch) * Math.min(1, 8 * dt);
+        this.chassis.rotation.x = this.pitch;
+
+        // Body leans in corners
+        this.chassis.rotation.z = -this.steer * Math.min(Math.abs(this.speed), 25) * 0.004;
+
+        // Wheels spin and front wheels turn
+        this.spins.forEach((s) => { s.rotation.x -= this.speed * dt / 0.38; });
+        this.steers.forEach((s) => { s.rotation.y = this.steer * 0.5; });
+
+        // Boost flames at the back
+        this.flames.forEach((f) => {
+          f.visible = boosting;
+          f.scale.y = 0.8 + Math.random() * 0.8;
+        });
+
+        // Camera zooms out a bit when boosting (feels faster)
+        const cam = this.camEl.getObject3D('camera');
+        if (cam) {
+          const targetFov = boosting ? 85 : 70;
+          cam.fov += (targetFov - cam.fov) * Math.min(1, 5 * dt);
+          cam.updateProjectionMatrix();
+        }
+
+        // --- Update the on-screen info ---
+        this.speedText.textContent = 'Speed: ' + Math.round(Math.abs(this.speed) * 5) + ' km/h';
+        this.boostBar.style.width = this.boost + '%';
+      }
+    });
+  </script>
+
+  <style>
+    body { margin: 0; }
+    #hud {
+      position: fixed; top: 15px; left: 15px; z-index: 10;
+      color: white; font: bold 18px Arial, sans-serif;
+      background: rgba(0, 0, 0, 0.55); padding: 10px 14px; border-radius: 8px;
+    }
+    #boostBack { width: 180px; height: 12px; background: #333; border-radius: 6px; margin-top: 8px; overflow: hidden; }
+    #boostFill { width: 100%; height: 100%; background: linear-gradient(90deg, #ff6a00, #ffd000); }
+    #help {
+      position: fixed; bottom: 15px; left: 15px; z-index: 10;
+      color: white; font: 14px Arial, sans-serif;
+      background: rgba(0, 0, 0, 0.55); padding: 8px 12px; border-radius: 8px;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="hud">
+    <div id="speed">Speed: 0 km/h</div>
+    <div>Boost</div>
+    <div id="boostBack"><div id="boostFill"></div></div>
+  </div>
+  <div id="help">W/S = gas/brake &nbsp; A/D = steer &nbsp; Shift or Space = boost &nbsp; R = reset</div>
+
+  <a-scene fog="type: linear; color: #87ceeb; near: 60; far: 350">
+    <!-- Lights -->
+    <a-entity light="type: ambient; color: #ffffff; intensity: 0.7"></a-entity>
+    <a-entity light="type: directional; color: #ffffff; intensity: 0.8" position="-5 10 5"></a-entity>
+
+    <!-- Sky, ground, road -->
+    <a-sky color="#87ceeb"></a-sky>
+    <a-plane rotation="-90 0 0" width="800" height="800" color="#4a8f3c"></a-plane>
+    <a-plane rotation="-90 0 0" position="0 0.01 -200" width="10" height="600" color="#333"></a-plane>
+    <a-entity road-lines></a-entity>
+
+    <!-- Ramps -->
+    <a-entity build-ramps></a-entity>
+
+    <!-- Scenery -->
+    <a-box position="8 1 -20" width="2" height="2" depth="2" color="#e74c3c"></a-box>
+    <a-box position="-8 1 -45" width="2" height="2" depth="2" color="#9b59b6"></a-box>
+    <a-cylinder position="12 2 -10" radius="0.5" height="4" color="#8b5a2b"></a-cylinder>
+    <a-sphere position="12 5 -10" radius="2" color="#2e7d32"></a-sphere>
+    <a-cylinder position="-12 2 -30" radius="0.5" height="4" color="#8b5a2b"></a-cylinder>
+    <a-sphere position="-12 5 -30" radius="2" color="#2e7d32"></a-sphere>
+    <a-cylinder position="13 2 -110" radius="0.5" height="4" color="#8b5a2b"></a-cylinder>
+    <a-sphere position="13 5 -110" radius="2" color="#2e7d32"></a-sphere>
+    <a-cylinder position="-13 2 -140" radius="0.5" height="4" color="#8b5a2b"></a-cylinder>
+    <a-sphere position="-13 5 -140" radius="2" color="#2e7d32"></a-sphere>
+
+    <!-- THE CAR (front of the car points to -z) -->
+    <a-entity id="car" car-controls position="0 0 0">
+      <a-entity id="chassis">
+
+        <!-- Underbody -->
+        <a-box position="0 0.3 0" width="1.7" height="0.15" depth="4" color="#111"></a-box>
+
+        <!-- Main body, hood, trunk -->
+        <a-box position="0 0.65 0" width="1.9" height="0.55" depth="4.4" color="#c1121f" metalness="0.6" roughness="0.3"></a-box>
+        <a-box position="0 0.95 -1.5" width="1.8" height="0.15" depth="1.3" color="#c1121f" metalness="0.6" roughness="0.3"></a-box>
+        <a-box position="0 0.95 1.6" width="1.8" height="0.15" depth="1.0" color="#c1121f" metalness="0.6" roughness="0.3"></a-box>
+
+        <!-- Cabin (dark glass) and roof -->
+        <a-box position="0 1.2 0.25" width="1.5" height="0.5" depth="1.4" color="#10202b" metalness="0.8" roughness="0.1"></a-box>
+        <a-box position="0 1.5 0.25" width="1.55" height="0.08" depth="1.3" color="#c1121f" metalness="0.6" roughness="0.3"></a-box>
+
+        <!-- Windshield and rear window -->
+        <a-box position="0 1.2 -0.78" rotation="-38 0 0" width="1.5" height="0.04" depth="0.82"
+               color="#7fb7d9" opacity="0.65" transparent="true"></a-box>
+        <a-box position="0 1.2 1.18" rotation="48 0 0" width="1.5" height="0.04" depth="0.67"
+               color="#7fb7d9" opacity="0.65" transparent="true"></a-box>
+
+        <!-- Bumpers -->
+        <a-box position="0 0.45 -2.25" width="1.95" height="0.25" depth="0.15" color="#222"></a-box>
+        <a-box position="0 0.45 2.25" width="1.95" height="0.25" depth="0.15" color="#222"></a-box>
+
+        <!-- Lights -->
+        <a-box position="-0.65 0.72 -2.21" width="0.4" height="0.15" depth="0.05" material="shader: flat; color: #fff7b0"></a-box>
+        <a-box position="0.65 0.72 -2.21" width="0.4" height="0.15" depth="0.05" material="shader: flat; color: #fff7b0"></a-box>
+        <a-box position="-0.7 0.75 2.21" width="0.4" height="0.15" depth="0.05" material="shader: flat; color: #ff2020"></a-box>
+        <a-box position="0.7 0.75 2.21" width="0.4" height="0.15" depth="0.05" material="shader: flat; color: #ff2020"></a-box>
+
+        <!-- Spoiler -->
+        <a-box position="-0.6 1.07 2.0" width="0.08" height="0.25" depth="0.1" color="#111"></a-box>
+        <a-box position="0.6 1.07 2.0" width="0.08" height="0.25" depth="0.1" color="#111"></a-box>
+        <a-box position="0 1.22 2.0" width="1.9" height="0.06" depth="0.45" color="#111"></a-box>
+
+        <!-- Wheels (front ones have class "steer" so they can turn) -->
+        <a-entity wheel class="steer" position="-1 0.38 -1.4"></a-entity>
+        <a-entity wheel class="steer" position="1 0.38 -1.4"></a-entity>
+        <a-entity wheel position="-1 0.38 1.4"></a-entity>
+        <a-entity wheel position="1 0.38 1.4"></a-entity>
+
+        <!-- Boost flames (only show while boosting) -->
+        <a-cone class="flame" visible="false" position="-0.5 0.5 2.7" rotation="90 0 0"
+                radius-bottom="0.15" radius-top="0" height="0.9" material="shader: flat; color: #ff8c00"></a-cone>
+        <a-cone class="flame" visible="false" position="0.5 0.5 2.7" rotation="90 0 0"
+                radius-bottom="0.15" radius-top="0" height="0.9" material="shader: flat; color: #ff8c00"></a-cone>
+      </a-entity>
+
+      <!-- Camera follows the car from behind -->
+      <a-camera id="cam" position="0 4 9" rotation="-15 0 0"
+                look-controls="enabled: false"
+                wasd-controls="enabled: false"></a-camera>
+    </a-entity>
+  </a-scene>
+</body>
+</html>
